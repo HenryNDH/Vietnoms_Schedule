@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { DataToolbar } from './components/DataToolbar'
 import { Header } from './components/Header'
 import { LocationTabs } from './components/LocationTabs'
 import { ScheduleGrid } from './components/ScheduleGrid'
@@ -16,6 +17,7 @@ export default function App() {
     selectedDay,
     setSelectedDay,
     employees,
+    availability,
     assignShift,
     unassignFromCell,
     setDayAvailability,
@@ -27,6 +29,10 @@ export default function App() {
     getStaffDayStatus,
     getAssignmentOnDay,
     getOtherLocation,
+    syncStatus,
+    lastSavedAt,
+    importAppData,
+    isCloudSyncEnabled,
   } = useSchedule()
 
   const [pendingAssignment, setPendingAssignment] = useState<PendingAssignment | null>(null)
@@ -74,6 +80,14 @@ export default function App() {
 
       <main className="app-main">
         <LocationTabs active={activeLocation} onChange={setActiveLocation} />
+
+        <DataToolbar
+          syncStatus={syncStatus}
+          lastSavedAt={lastSavedAt}
+          isCloudSyncEnabled={isCloudSyncEnabled}
+          getAppData={() => ({ employees, schedule, availability, updatedAt: lastSavedAt })}
+          onImport={importAppData}
+        />
 
         <div className="schedule-toolbar">
           <p className="schedule-toolbar__label">

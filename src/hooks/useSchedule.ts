@@ -1,5 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_EMPLOYEES } from '../data/employees'
+import { loadCloudAppData, saveCloudAppData, subscribeCloudAppData } from '../lib/cloud'
+import {
+  type AppData,
+  isCloudSyncEnabled,
+  loadLocalAppData,
+  saveLocalAppData,
+} from '../lib/storage'
 import {
   DAYS,
   LOCATIONS,
@@ -14,21 +21,6 @@ import {
   emptySchedule,
   isManuallyAvailable,
 } from '../types'
-
-const SCHEDULE_STORAGE_KEY = 'vietnoms-schedule-v2'
-const EMPLOYEES_STORAGE_KEY = 'vietnoms-employees-v3'
-const AVAILABILITY_STORAGE_KEY = 'vietnoms-availability-v1'
-
-function loadSchedule(): LocationSchedule {
-  try {
-    const raw = localStorage.getItem(SCHEDULE_STORAGE_KEY)
-    if (!raw) return emptySchedule()
-    const parsed = JSON.parse(raw) as LocationSchedule
-    return normalizeSchedule(parsed)
-  } catch {
-    return emptySchedule()
-  }
-}
 
 function normalizeSchedule(data: LocationSchedule): LocationSchedule {
   const next = emptySchedule()
@@ -46,23 +38,22 @@ function normalizeSchedule(data: LocationSchedule): LocationSchedule {
   return next
 }
 
-function loadEmployees(): Employee[] {
-  try {
-    const raw = localStorage.getItem(EMPLOYEES_STORAGE_KEY)
-    if (!raw) return DEFAULT_EMPLOYEES
-    return JSON.parse(raw) as Employee[]
-  } catch {
-    return DEFAULT_EMPLOYEES
+function initialAppData(): AppData {
+  const local = loadLocalAppData()
+  if (local) {
+    return {
+      employees: local.employees.length > 0 ? local.employees : DEFAULT_EMPLOYEES,
+      schedule: normalizeSchedule(local.schedule),
+      availability: local.availability ?? {},
+      updatedAt: local.updatedAt,
+    }
   }
-}
 
-function loadAvailability(): EmployeeAvailability {
-  try {
-    const raw = localStorage.getItem(AVAILABILITY_STORAGE_KEY)
-    if (!raw) return {}
-    return JSON.parse(raw) as EmployeeAvailability
-  } catch {
-    return {}
+  return {
+    employees: DEFAULT_EMPLOYEES,
+    schedule: emptySchedule(),
+    availability: {},
+    updatedAt: new Date().toISOString(),
   }
 }
 
@@ -109,24 +100,128 @@ function findAssignmentOnDay(
   return null
 }
 
+function isNewer(a: string, b: string): boolean {
+  return new Date(a).getTime() > new Date(b).getTime()
+}
+
+export type SyncStatus = 'local' | 'syncing' | 'synced' | 'error'
+
 export function useSchedule() {
-  const [schedule, setSchedule] = useState<LocationSchedule>(loadSchedule)
-  const [employees, setEmployees] = useState<Employee[]>(loadEmployees)
-  const [availability, setAvailability] = useState<EmployeeAvailability>(loadAvailability)
+  const initial = useMemo(() => initialAppData(), [])
+  const [schedule, setSchedule] = useState<LocationSchedule>(initial.schedule)
+  const [employees, setEmployees] = useState<Employee[]>(initial.employees)
+  const [availability, setAvailability] = useState<EmployeeAvailability>(initial.availability)
   const [activeLocation, setActiveLocation] = useState<LocationId>('downtown')
   const [selectedDay, setSelectedDay] = useState<Day | null>(null)
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>(isCloudSyncEnabled() ? 'syncing' : 'local')
+  const [lastSavedAt, setLastSavedAt] = useState(initial.updatedAt)
+
+  const updatedAtRef = useRef(initial.updatedAt)
+  const cloudTimerRef = useRef<number | null>(null)
+  const skipNextCloudSaveRef = useRef(false)
+
+  const persist = useCallback((next: Omit<AppData, 'updatedAt'>) => {
+    const data: AppData = {
+      ...next,
+      updatedAt: new Date().toISOString(),
+    }
+    updatedAtRef.current = data.updatedAt
+    setLastSavedAt(data.updatedAt)
+    saveLocalAppData(data)
+
+    if (!isCloudSyncEnabled()) {
+      setSyncStatus('local')
+      return
+    }
+
+    setSyncStatus('syncing')
+    if (cloudTimerRef.current) window.clearTimeout(cloudTimerRef.current)
+    cloudTimerRef.current = window.setTimeout(async () => {
+      try {
+        await saveCloudAppData(data)
+        setSyncStatus('synced')
+      } catch {
+        setSyncStatus('error')
+      }
+    }, 800)
+  }, [])
+
+  const applyRemoteData = useCallback((data: AppData) => {
+    if (!isNewer(data.updatedAt, updatedAtRef.current)) return
+    skipNextCloudSaveRef.current = true
+    updatedAtRef.current = data.updatedAt
+    setLastSavedAt(data.updatedAt)
+    setEmployees(data.employees)
+    setSchedule(normalizeSchedule(data.schedule))
+    setAvailability(data.availability ?? {})
+    saveLocalAppData(data)
+    setSyncStatus('synced')
+  }, [])
 
   useEffect(() => {
-    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(schedule))
-  }, [schedule])
+    persist({ employees, schedule, availability })
+  }, [employees, schedule, availability, persist])
 
   useEffect(() => {
-    localStorage.setItem(EMPLOYEES_STORAGE_KEY, JSON.stringify(employees))
-  }, [employees])
+    if (!isCloudSyncEnabled()) return
 
-  useEffect(() => {
-    localStorage.setItem(AVAILABILITY_STORAGE_KEY, JSON.stringify(availability))
-  }, [availability])
+    let cancelled = false
+
+    async function bootstrapCloud() {
+      try {
+        const cloud = await loadCloudAppData()
+        if (cancelled) return
+
+        if (cloud && isNewer(cloud.updatedAt, updatedAtRef.current)) {
+          applyRemoteData(cloud)
+        } else {
+          await saveCloudAppData({
+            employees,
+            schedule,
+            availability,
+            updatedAt: updatedAtRef.current,
+          })
+        }
+        setSyncStatus('synced')
+      } catch {
+        if (!cancelled) setSyncStatus('error')
+      }
+    }
+
+    bootstrapCloud()
+    const unsubscribe = subscribeCloudAppData((data) => {
+      if (skipNextCloudSaveRef.current) {
+        skipNextCloudSaveRef.current = false
+        return
+      }
+      applyRemoteData(data)
+    })
+
+    return () => {
+      cancelled = true
+      unsubscribe()
+      if (cloudTimerRef.current) window.clearTimeout(cloudTimerRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const importAppData = useCallback((data: AppData) => {
+    const normalized: AppData = {
+      employees: data.employees,
+      schedule: normalizeSchedule(data.schedule),
+      availability: data.availability ?? {},
+      updatedAt: data.updatedAt ?? new Date().toISOString(),
+    }
+    updatedAtRef.current = normalized.updatedAt
+    setEmployees(normalized.employees)
+    setSchedule(normalized.schedule)
+    setAvailability(normalized.availability)
+    setLastSavedAt(normalized.updatedAt)
+    saveLocalAppData(normalized)
+    if (isCloudSyncEnabled()) {
+      saveCloudAppData(normalized).catch(() => setSyncStatus('error'))
+    }
+  }, [])
 
   const employeeMap = useMemo(() => {
     return new Map(employees.map((employee) => [employee.id, employee]))
@@ -256,6 +351,7 @@ export function useSchedule() {
     selectedDay,
     setSelectedDay,
     employees,
+    availability,
     assignShift,
     unassignFromCell,
     setDayAvailability,
@@ -267,5 +363,9 @@ export function useSchedule() {
     getStaffDayStatus,
     getAssignmentOnDay,
     getOtherLocation,
+    syncStatus,
+    lastSavedAt,
+    importAppData,
+    isCloudSyncEnabled: isCloudSyncEnabled(),
   }
 }
